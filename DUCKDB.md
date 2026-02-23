@@ -1,6 +1,8 @@
-# `duckdb_pipeline.py` (SWAN)
+# DuckDB Conversion Pipeline
 
 This document explains what `SWAN/duckdb_pipeline.py` currently does and how to run it.
+
+Before running the script, make sure to unzip the `SWAN/databases/dev_databases.zip` file. This will create the `SWAN/databases/dev_databases` directory.
 
 ## CLI arguments (all)
 
