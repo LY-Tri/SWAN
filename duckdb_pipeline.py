@@ -714,6 +714,7 @@ def main() -> int:
                 if len(row) < 4:
                     continue
                 db_id = row[0].strip()
+                query = row[2]
                 gold_sql = row[3]
                 if not db_id or not gold_sql:
                     continue
@@ -791,8 +792,9 @@ def main() -> int:
                             rec = {
                                 "question_id": qid,
                                 "db": db_id,
-                                "gold_sql": gold_sql,
-                                "duck_sql": duck_sql,
+                                "query": query,
+                                # "gold_sql": gold_sql,
+                                "sql": duck_sql,
                                 "answer": _canonicalize_jsonable_rows(_jsonable_rows(got)),
                             }
                             if args.out_broken:

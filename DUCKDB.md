@@ -4,7 +4,50 @@ This document explains what `SWAN/duckdb_pipeline.py` currently does and how to 
 
 Before running the script, make sure to unzip the `SWAN/databases/dev_databases.zip` file. This will create the `SWAN/databases/dev_databases` directory.
 
-## CLI arguments (all)
+## Usage
+```bash
+python SWAN/duckdb_pipeline.py \
+--db-root SWAN/databases/dev_databases \
+--duckdb-out-root swan/duckdb \
+--drop-columns --drop-dst-root swan/duckdb_dropped   \
+--compare-to sqlite --rewrite --unordered \
+--out-compatible swan/query.jsonl --out-broken
+```
+
+The expected output is:
+```
+Baseline (no dropped columns)
+Evaluated DuckDB root: /home/lynie/projects/swan/duckdb
+Per-DB results:
+- california_schools: 28/30 = 93.3% (exec_errors=0, mismatches=2, transpile_errors=0)
+- european_football_2: 14/30 = 46.7% (exec_errors=12, mismatches=4, transpile_errors=0)
+- formula_1: 28/30 = 93.3% (exec_errors=1, mismatches=1, transpile_errors=0)
+- superhero: 28/30 = 93.3% (exec_errors=0, mismatches=2, transpile_errors=0)
+
+Overall:
+- accuracy: 98/120 = 81.7%
+- exec_errors: 13
+- mismatches: 9
+- transpile_errors: 0
+
+Baseline-compatible subset size: 98
+
+After dropping columns (evaluated only on baseline-compatible subset)
+Evaluated DuckDB root: /home/lynie/projects/swan/duckdb_dropped
+Per-DB results:
+- california_schools: 9/28 = 32.1% (exec_errors=0, mismatches=19, transpile_errors=0)
+- european_football_2: 1/14 = 7.1% (exec_errors=0, mismatches=13, transpile_errors=0)
+- formula_1: 2/28 = 7.1% (exec_errors=0, mismatches=26, transpile_errors=0)
+- superhero: 0/28 = 0.0% (exec_errors=0, mismatches=28, transpile_errors=0)
+
+Overall:
+- accuracy: 12/98 = 12.2%
+- exec_errors: 0
+- mismatches: 86
+- transpile_errors: 0
+```
+
+## CLI arguments
 
 These are the current CLI flags (from `python SWAN/duckdb_pipeline.py --help`):
 
