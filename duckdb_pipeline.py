@@ -219,10 +219,10 @@ def _filter_query_csvs(csv_paths: list[Path]) -> list[Path]:
     out: list[Path] = []
     for p in csv_paths:
         name = p.name
-        if not name.endswith("_HybridQueries.csv"):
+        if name.endswith("_HybridQueries.csv"):
             out.append(p)
             continue
-        counterpart = name.replace("_HybridQueries.csv", "Queries.csv")
+        counterpart = name.replace("Queries.csv", "_HybridQueries.csv")
         if counterpart not in by_name:
             out.append(p)
             continue
@@ -294,7 +294,7 @@ def rewrite_for_duckdb(sql: str) -> str:
     # cast birthday to TIMESTAMP.
     sql = re.sub(
         r"(CURRENT_TIMESTAMP)\s*-\s*([A-Za-z_][A-Za-z0-9_]*\.)?birthday\b",
-        r"\\1 - CAST(\\2birthday AS TIMESTAMP)",
+        r"\1 - CAST(\2birthday AS TIMESTAMP)",
         sql,
         flags=re.IGNORECASE,
     )
@@ -303,13 +303,13 @@ def rewrite_for_duckdb(sql: str) -> str:
     # non-grouped column with ANY_VALUE to match SQLite's loose grouping behavior.
     sql = re.sub(
         r"\bSELECT\s+(t1\.)player_name\b",
-        r"SELECT ANY_VALUE(\\1player_name) AS player_name",
+        r"SELECT ANY_VALUE(\1player_name) AS player_name",
         sql,
         flags=re.IGNORECASE,
     )
     sql = re.sub(
         r"\bSELECT\s+(teamInfo\.)team_long_name\b",
-        r"SELECT ANY_VALUE(\\1team_long_name) AS team_long_name",
+        r"SELECT ANY_VALUE(\1team_long_name) AS team_long_name",
         sql,
         flags=re.IGNORECASE,
     )
@@ -528,6 +528,71 @@ def nullify_columns_in_duckdb(
         conn.close()
 
 
+def drop_columns_in_duckdb(
+    *,
+    db_id: str,
+    src_duckdb: Path,
+    dst_duckdb: Path,
+    columns: list[str],
+    verbose: bool,
+) -> int:
+    dst_duckdb.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src_duckdb, dst_duckdb)
+
+    conn = duckdb.connect(str(dst_duckdb))
+    try:
+        table_map = _duck_list_tables(conn)
+        table_aliases = {"fprm": "frpm"}  # observed typo in columns_to_drop.pickle
+
+        applied = 0
+        failed = 0
+        missing = 0
+
+        for ref in columns:
+            for table_raw, col_raw in _iter_pairs(ref):
+                t = table_raw.strip().strip('"').strip("`")
+                t_norm = table_aliases.get(t.lower(), t.lower())
+                table = table_map.get(t_norm)
+                if not table:
+                    missing += 1
+                    if verbose:
+                        print(f"[missing-table] {db_id}: {table_raw} (from {ref!r})", file=sys.stderr)
+                    continue
+
+                col_map = _duck_table_info(conn, table)
+                ci = col_map.get(col_raw.lower())
+                if not ci:
+                    missing += 1
+                    if verbose:
+                        print(
+                            f"[missing-col] {db_id}: {table}.{col_raw} (from {ref!r})",
+                            file=sys.stderr,
+                        )
+                    continue
+
+                col_name, _col_type, _notnull, _pk = ci
+                try:
+                    conn.execute(f"ALTER TABLE {_dq(table)} DROP COLUMN {_dq(col_name)}")
+                    applied += 1
+                except Exception as e:
+                    failed += 1
+                    if verbose:
+                        print(
+                            f"[fail] {db_id}: could not drop {table}.{col_name} ({ref!r}): "
+                            f"{type(e).__name__}: {e}",
+                            file=sys.stderr,
+                        )
+
+        if verbose:
+            print(
+                f"[ok] {db_id}: wrote {dst_duckdb} | applied={applied} missing={missing} failed={failed}",
+                file=sys.stderr,
+            )
+        return 0 if failed == 0 else 2
+    finally:
+        conn.close()
+
+
 @dataclass
 class EvalStats:
     total: int = 0
@@ -586,6 +651,14 @@ def main() -> int:
         help="Compare result rows as an unordered multiset (useful when queries lack ORDER BY).",
     )
     parser.add_argument(
+        "--print-baseline-errors",
+        action="store_true",
+        help=(
+            "If set, print baseline evaluation error messages (transpile/exec/missing DB) to stderr. "
+            "This is useful to inspect which queries contribute to baseline exec_errors."
+        ),
+    )
+    parser.add_argument(
         "--out-compatible",
         default="",
         help="If set, write JSONL of question_ids whose DuckDB results match the comparison source.",
@@ -602,7 +675,19 @@ def main() -> int:
     parser.add_argument(
         "--drop-columns",
         action="store_true",
-        help="Create DuckDB copies with columns-to-drop nulled out (per columns_to_drop.pickle).",
+        help=(
+            "Create DuckDB copies with columns listed in columns_to_drop.pickle modified. "
+            "Use --drop-behavior to control whether we NULL them out (default) or DROP COLUMN."
+        ),
+    )
+    parser.add_argument(
+        "--drop-behavior",
+        choices=("nullify", "drop"),
+        default="nullify",
+        help=(
+            'Only meaningful with --drop-columns. "nullify" keeps schema and sets values to NULL (default). '
+            '"drop" removes columns with ALTER TABLE DROP COLUMN; downstream SQL may error and is treated as broken.'
+        ),
     )
     parser.add_argument(
         "--drop-pickle",
@@ -703,6 +788,7 @@ def main() -> int:
         restrict_to: set[tuple[str, str]] | None,
         record_compatible: bool,
         capture_records: bool,
+        print_errors: bool,
     ) -> tuple[dict[str, EvalStats], set[tuple[str, str]], dict[tuple[str, str], dict[str, Any]]]:
         by_db: dict[str, EvalStats] = {}
         compatible: set[tuple[str, str]] = set()
@@ -714,8 +800,11 @@ def main() -> int:
                 if len(row) < 4:
                     continue
                 db_id = row[0].strip()
-                query = row[2]
+                query = row[1]
+                hint = row[2]
                 gold_sql = row[3]
+                complexity_score = row[4]
+                blend_sql = row[5]
                 if not db_id or not gold_sql:
                     continue
                 if only_db and db_id != only_db:
@@ -739,6 +828,11 @@ def main() -> int:
                     stats.total += 1
                     if not sqlite_db_path.is_file():
                         stats.exec_errors += 1
+                        if print_errors:
+                            print(
+                                f"[baseline-missing-sqlite] {db_id} {qid}: missing {sqlite_db_path}",
+                                file=sys.stderr,
+                            )
                         continue
                     try:
                         sconn = sqlite3.connect(str(sqlite_db_path))
@@ -746,8 +840,13 @@ def main() -> int:
                             sqlite_rows = sconn.execute(gold_sql).fetchall()
                         finally:
                             sconn.close()
-                    except Exception:
+                    except Exception as e:
                         stats.exec_errors += 1
+                        if print_errors:
+                            print(
+                                f"[baseline-sqlite-exec-error] {db_id} {qid}: {type(e).__name__}: {e}",
+                                file=sys.stderr,
+                            )
                         continue
 
                 stats = by_db.setdefault(db_id, EvalStats())
@@ -756,9 +855,14 @@ def main() -> int:
 
                 try:
                     duck_sql = transpile_sql(gold_sql)
-                except Exception:
+                except Exception as e:
                     stats.transpile_errors += 1
                     stats.exec_errors += 1
+                    if print_errors:
+                        print(
+                            f"[baseline-transpile-error] {db_id} {qid}: {type(e).__name__}: {e}",
+                            file=sys.stderr,
+                        )
                     continue
 
                 if args.rewrite:
@@ -767,13 +871,23 @@ def main() -> int:
                 duck_db_path = duckdb_root / f"{db_id}.duckdb"
                 if not duck_db_path.is_file():
                     stats.exec_errors += 1
+                    if print_errors:
+                        print(
+                            f"[baseline-missing-duckdb] {db_id} {qid}: missing {duck_db_path}",
+                            file=sys.stderr,
+                        )
                     continue
 
                 conn = duckdb.connect(str(duck_db_path), read_only=True)
                 try:
                     got = conn.execute(duck_sql).fetchall()
-                except Exception:
+                except Exception as e:
                     stats.exec_errors += 1
+                    if print_errors:
+                        print(
+                            f"[baseline-duckdb-exec-error] {db_id} {qid}: {type(e).__name__}: {e}\nSQL: {duck_sql}",
+                            file=sys.stderr,
+                        )
                     continue
                 finally:
                     conn.close()
@@ -793,8 +907,11 @@ def main() -> int:
                                 "question_id": qid,
                                 "db": db_id,
                                 "query": query,
+                                "hint": hint,
                                 # "gold_sql": gold_sql,
                                 "sql": duck_sql,
+                                "complexity": complexity_score,
+                                "blendsql": blend_sql,
                                 "answer": _canonicalize_jsonable_rows(_jsonable_rows(got)),
                             }
                             if args.out_broken:
@@ -813,6 +930,7 @@ def main() -> int:
         restrict_to=None,
         record_compatible=bool(args.drop_columns or out_compatible is not None),
         capture_records=bool(args.out_broken),
+        print_errors=bool(args.print_baseline_errors),
     )
     _report("Baseline (no dropped columns)", duckdb_out_root, baseline_by_db)
 
@@ -836,19 +954,29 @@ def main() -> int:
                 print(f"[missing-src] {db_id}: {src_duck}", file=sys.stderr)
                 continue
 
-            _ = nullify_columns_in_duckdb(
-                db_id=db_id,
-                src_duckdb=src_duck,
-                dst_duckdb=dst_duck,
-                columns=cols,
-                verbose=bool(args.verbose_drop),
-            )
+            if args.drop_behavior == "drop":
+                _ = drop_columns_in_duckdb(
+                    db_id=db_id,
+                    src_duckdb=src_duck,
+                    dst_duckdb=dst_duck,
+                    columns=cols,
+                    verbose=bool(args.verbose_drop),
+                )
+            else:
+                _ = nullify_columns_in_duckdb(
+                    db_id=db_id,
+                    src_duckdb=src_duck,
+                    dst_duckdb=dst_duck,
+                    columns=cols,
+                    verbose=bool(args.verbose_drop),
+                )
 
         dropped_by_db, _still_compatible, _ = _evaluate(
             drop_dst_root,
             restrict_to=compatible,
             record_compatible=False,
             capture_records=False,
+            print_errors=False,
         )
         print(f"\nBaseline-compatible subset size: {len(compatible)}")
         _report("After dropping columns (evaluated only on baseline-compatible subset)", drop_dst_root, dropped_by_db)
@@ -860,6 +988,7 @@ def main() -> int:
                 restrict_to=compatible,
                 record_compatible=True,
                 capture_records=False,
+                print_errors=False,
             )
             broken = compatible - still_ok
             for key in sorted(broken):

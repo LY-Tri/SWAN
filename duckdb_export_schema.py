@@ -60,34 +60,50 @@ def _quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _quote_qualified(*parts: str) -> str:
+    return ".".join(_quote_ident(p) for p in parts if p)
+
+
 def export_one(db_id: str, duckdb_path: Path, out_root: Path, *, sample_rows: int) -> None:
     out_dir = out_root / db_id / db_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect(str(duckdb_path), read_only=True)
     try:
-        tables = [r[0] for r in con.execute("SHOW TABLES").fetchall()]
+        # NOTE: DuckDB's SHOW TABLES only returns tables in the current schema.
+        # Some SWAN DBs store tables under a non-default schema, so we must query
+        # information_schema to find them.
+        tables = con.execute(
+            """
+            SELECT table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_type = 'BASE TABLE'
+              AND table_schema NOT IN ('information_schema', 'pg_catalog')
+            ORDER BY table_schema, table_name
+            """
+        ).fetchall()
 
         ddl_rows: list[tuple[str, str, str]] = []
-        for table in tables:
-            desc_rows = con.execute(f"DESCRIBE {_quote_ident(table)}").fetchall()
+        for schema, table in tables:
+            table_ref = _quote_qualified(str(schema), str(table))
+            desc_rows = con.execute(f"DESCRIBE {table_ref}").fetchall()
             col_names = [str(r[0]) for r in desc_rows]
             duck_types = [str(r[1]) for r in desc_rows]
             simple_types = [_simple_type(t) for t in duck_types]
 
             # DDL.csv row
-            ddl_lines = [f"create or replace TABLE {table} ("]
+            ddl_lines = [f"create or replace TABLE {_quote_ident(str(table))} ("]
             for i, (cn, st) in enumerate(zip(col_names, simple_types)):
                 comma = "," if i < len(col_names) - 1 else ""
                 ddl_lines.append(f'\t{_quote_ident(cn)} {_ddl_type(st)}{comma}')
             ddl_lines.append(");")
             ddl = "\n".join(ddl_lines)
-            ddl_rows.append((table, "", ddl))
+            ddl_rows.append((str(table), "", ddl))
 
             # Per-table JSON schema
             sample: list[dict[str, Any]] = []
             if sample_rows > 0:
-                rows = con.execute(f"SELECT * FROM {_quote_ident(table)} LIMIT {int(sample_rows)}").fetchall()
+                rows = con.execute(f"SELECT * FROM {table_ref} LIMIT {int(sample_rows)}").fetchall()
                 for row in rows:
                     sample.append({cn: _jsonable_scalar(v) for cn, v in zip(col_names, row)})
 
@@ -115,17 +131,15 @@ def export_one(db_id: str, duckdb_path: Path, out_root: Path, *, sample_rows: in
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Export schema artifacts (DDL.csv + per-table JSON) from DuckDBs in SWAN/db_eval."
+        description="Export schema artifacts (DDL.csv + per-table JSON)."
     )
     parser.add_argument(
-        "--db-eval-dir",
-        default=str(Path(__file__).resolve().parent / "db_eval"),
-        help="Directory containing <db_id>.duckdb files (default: SWAN/db_eval).",
+        "--db", required=True,
+        help="Directory containing <db_id>.duckdb files.",
     )
     parser.add_argument(
-        "--out-root",
-        default=str(Path(__file__).resolve().parent / "db_eval"),
-        help="Root directory to write schema artifacts under (default: SWAN/db_eval).",
+        "--out", required=True,
+        help="Root directory to write schema artifacts under.",
     )
     parser.add_argument(
         "--sample-rows",
@@ -135,15 +149,27 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    db_eval_dir = Path(args.db_eval_dir).resolve()
-    out_root = Path(args.out_root).resolve()
+    db_eval_dir = Path(args.db).resolve()
+    out_root = Path(args.out).resolve()
 
-    duckdb_files = sorted(db_eval_dir.glob("*.duckdb"))
+    duckdb_files = sorted(
+        (p for p in db_eval_dir.rglob("*.duckdb") if p.is_file()),
+        key=lambda p: p.as_posix(),
+    )
     if not duckdb_files:
         raise SystemExit(f"No .duckdb files found in: {db_eval_dir}")
 
+    seen_db_ids: set[str] = set()
     for p in duckdb_files:
         db_id = p.stem
+        if db_id in seen_db_ids:
+            rel = p.relative_to(db_eval_dir)
+            raise SystemExit(
+                "Duplicate db_id discovered while scanning recursively: "
+                f"{db_id!r} (example path: {rel}). "
+                "Ensure filenames are unique or rename the databases."
+            )
+        seen_db_ids.add(db_id)
         export_one(db_id, p, out_root, sample_rows=int(args.sample_rows))
         print(f"[ok] {db_id} -> {out_root / db_id / db_id}")
 

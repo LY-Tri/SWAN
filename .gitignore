@@ -1,4 +1,5 @@
 databases/dev_databases/
+databases/duckdb/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
