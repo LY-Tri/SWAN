@@ -35,6 +35,12 @@ duckdb = _require_import("duckdb")
 sqlglot = _require_import("sqlglot")
 sqlite2duckdb = _require_import("sqlite2duckdb")
 
+# Tolerance for numeric answer comparison.
+# Both the ordered scalar comparison (math.isclose) and the unordered row-hashing
+# path (float rounding) use this value. Increase if tiny floating-point differences
+# from SQLite→DuckDB conversion cause false mismatches.
+NUMERIC_PRECISION = 1e-5
+
 
 def _is_sqlite_file(p: Path) -> bool:
     try:
@@ -208,36 +214,32 @@ def transpile_sql(sqlite_sql: str) -> str:
     return out[0] if out else sqlite_sql
 
 
-_RE_STRFTIME_YEAR = re.compile(r"STRFTIME\(([^)]*?),\s*'%Y'\)")
+_RE_STRFTIME_YEAR = re.compile(r"STRFTIME\((.+?),\s*'%Y'\)")
 
 
 def _filter_query_csvs(csv_paths: list[Path]) -> list[Path]:
-    # Mirror SWAN/export_gold_answers.py behavior:
-    # if *_HybridQueries.csv fully overlaps on executed gold SQLs with *Queries.csv,
-    # skip hybrid to avoid duplicated work.
+    # If *_HybridQueries.csv fully overlaps on executed gold SQLs with *Queries.csv,
+    # skip the hybrid to avoid duplicated work (gold answers use plain CSV stems).
     by_name = {p.name: p for p in csv_paths}
+
+    def gold_rows(path: Path) -> list[tuple[str, str]]:
+        rows: list[tuple[str, str]] = []
+        for row in _iter_csv_rows(path):
+            db_id = row[0].strip() if len(row) > 0 else ""
+            gold_sql = row[3] if len(row) > 3 else ""
+            rows.append((db_id, gold_sql))
+        return rows
+
     out: list[Path] = []
     for p in csv_paths:
         name = p.name
         if name.endswith("_HybridQueries.csv"):
+            plain_name = name.replace("_HybridQueries.csv", "Queries.csv")
+            if plain_name in by_name and gold_rows(p) == gold_rows(by_name[plain_name]):
+                continue  # skip hybrid; plain CSV covers the same queries
             out.append(p)
-            continue
-        counterpart = name.replace("Queries.csv", "_HybridQueries.csv")
-        if counterpart not in by_name:
+        else:
             out.append(p)
-            continue
-
-        def gold_rows(path: Path) -> list[tuple[str, str]]:
-            rows: list[tuple[str, str]] = []
-            for row in _iter_csv_rows(path):
-                db_id = row[0].strip() if len(row) > 0 else ""
-                gold_sql = row[3] if len(row) > 3 else ""
-                rows.append((db_id, gold_sql))
-            return rows
-
-        if gold_rows(p) == gold_rows(by_name[counterpart]):
-            continue
-        out.append(p)
     return out
 
 
@@ -277,8 +279,29 @@ def _stable_key(x: Any) -> str:
     return json.dumps(x, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
 
 
+def _round_numeric(x: Any) -> Any:
+    """Normalize a value for hash-based unordered comparison.
+
+    - Numeric strings (e.g. '10017') are coerced to numbers so they hash the
+      same as their integer/float equivalents.
+    - Floats are rounded to one fewer decimal place than NUMERIC_PRECISION so
+      that values within tolerance always collapse to the same hash bucket.
+    - Whole-number floats are converted to int so 10017.0 and 10017 hash alike.
+    """
+    _hash_places = max(0, round(-math.log10(NUMERIC_PRECISION)) - 1)
+    n = _num(x)
+    if n is not None and math.isfinite(n):
+        rounded = round(n, _hash_places)
+        if rounded == int(rounded):
+            return int(rounded)
+        return rounded
+    return x
+
+
 def _rows_as_counter(rows: list[tuple[Any, ...]]) -> Counter[str]:
-    return Counter(_stable_key([_jsonable_scalar(v) for v in row]) for row in rows)
+    return Counter(
+        _stable_key([_round_numeric(_jsonable_scalar(v)) for v in row]) for row in rows
+    )
 
 
 def rewrite_for_duckdb(sql: str) -> str:
@@ -291,10 +314,10 @@ def rewrite_for_duckdb(sql: str) -> str:
         sql = _RE_STRFTIME_YEAR.sub(r"CAST(STRFTIME(\1, '%Y') AS INTEGER)", sql)
 
     # If query subtracts current_timestamp - some .birthday (stored as VARCHAR),
-    # cast birthday to TIMESTAMP.
+    # compute year difference with DATEDIFF to return an integer age.
     sql = re.sub(
         r"(CURRENT_TIMESTAMP)\s*-\s*([A-Za-z_][A-Za-z0-9_]*\.)?birthday\b",
-        r"\1 - CAST(\2birthday AS TIMESTAMP)",
+        r"DATEDIFF('year', CAST(\2birthday AS DATE), CURRENT_DATE)",
         sql,
         flags=re.IGNORECASE,
     )
@@ -350,7 +373,7 @@ def scalar_equal(a: Any, b: Any) -> bool:
     na = _num(a)
     nb = _num(b)
     if na is not None and nb is not None:
-        return math.isclose(na, nb, rel_tol=1e-9, abs_tol=1e-9)
+        return math.isclose(na, nb, rel_tol=NUMERIC_PRECISION, abs_tol=NUMERIC_PRECISION)
 
     return a == b
 
@@ -399,6 +422,62 @@ def rows_equal_sqlite_duckdb(
                     return False
         return True
     return _rows_as_counter(sqlite_rows) == _rows_as_counter(duck_rows)
+
+
+_RE_LIMIT_TAIL = re.compile(r"\s+LIMIT\s+\d+(\s+OFFSET\s+\d+)?\s*$", re.IGNORECASE)
+
+
+def _tie_extra_answers(
+    sql: str,
+    duck_db_path: Path,
+    got: list[tuple[Any, ...]],
+    exp: Any,
+) -> list[list[list[Any]]]:
+    """Check if a mismatch is caused by a tie at the LIMIT boundary.
+
+    Strips the top-level LIMIT, re-runs the query to get all eligible rows,
+    then verifies both `got` (DuckDB result) and `exp` (gold) are valid subsets
+    of that full result.  If so, returns a list of all distinct valid answer
+    sets found in the full result that share the same size as `got`.
+    Returns an empty list when the mismatch is not tie-related.
+    """
+    if not _RE_LIMIT_TAIL.search(sql):
+        return []
+    if not isinstance(exp, list) or len(exp) == 0:
+        return []
+
+    sql_no_limit = _RE_LIMIT_TAIL.sub("", sql).strip()
+    try:
+        conn = duckdb.connect(str(duck_db_path), read_only=True)
+        try:
+            all_rows = conn.execute(sql_no_limit).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+    all_counter = _rows_as_counter(all_rows)
+    got_counter = _rows_as_counter(got)
+    gold_tuples: list[tuple[Any, ...]] = [tuple(r) for r in exp]
+    gold_counter = _rows_as_counter(gold_tuples)
+
+    # Both got and gold must be subsets of the full result.
+    for key, cnt in got_counter.items():
+        if all_counter.get(key, 0) < cnt:
+            return []
+    for key, cnt in gold_counter.items():
+        if all_counter.get(key, 0) < cnt:
+            return []
+
+    # Collect all distinct valid answers: canonicalize got and gold.
+    got_canonical = _canonicalize_jsonable_rows(_jsonable_rows(got))
+    gold_canonical = _canonicalize_jsonable_rows(list(exp))
+    extra: list[list[list[Any]]] = []
+    seen = {_stable_key(got_canonical)}
+    if _stable_key(gold_canonical) not in seen:
+        extra.append(gold_canonical)
+        seen.add(_stable_key(gold_canonical))
+    return extra
 
 
 PAIR_RE = re.compile(
@@ -722,7 +801,11 @@ def main() -> int:
                     if not line.strip():
                         continue
                     obj = json.loads(line)
-                    expected[obj["question_id"]] = obj["answer"]
+                    raw_qid = obj["question_id"]
+                    # Normalize old-format IDs (e.g. "formula_1Queries:3" -> "formula_1_3")
+                    # to match the pipeline's current question_id format.
+                    norm_qid = re.sub(r"Queries:(\d+)$", r"_\1", raw_qid)
+                    expected[norm_qid] = obj["answer"]
 
     # Collect query CSVs (prefer non-hybrid; match export_gold_answers behavior minimally)
     csv_paths = sorted(questions_dir.glob("*Queries.csv"))
@@ -748,6 +831,10 @@ def main() -> int:
     out_compatible = None
     if args.out_compatible:
         out_compatible = open(args.out_compatible, "w", encoding="utf-8", newline="\n")
+
+    duckdb_out_root.mkdir(parents=True, exist_ok=True)
+    out_mismatches = open(duckdb_out_root / "mismatches.jsonl", "w", encoding="utf-8", newline="\n")
+
     if args.out_broken:
         if not args.drop_columns:
             raise SystemExit("--out-broken requires --drop-columns")
@@ -789,6 +876,7 @@ def main() -> int:
         record_compatible: bool,
         capture_records: bool,
         print_errors: bool,
+        log_mismatches: bool,
     ) -> tuple[dict[str, EvalStats], set[tuple[str, str]], dict[tuple[str, str], dict[str, Any]]]:
         by_db: dict[str, EvalStats] = {}
         compatible: set[tuple[str, str]] = set()
@@ -810,7 +898,7 @@ def main() -> int:
                 if only_db and db_id != only_db:
                     continue
 
-                qid = f"{base}:{row_idx}"
+                qid = f"{base.removesuffix('Queries')}_{row_idx}"
                 key = (db_id, qid)
                 if restrict_to is not None and key not in restrict_to:
                     continue
@@ -833,6 +921,8 @@ def main() -> int:
                                 f"[baseline-missing-sqlite] {db_id} {qid}: missing {sqlite_db_path}",
                                 file=sys.stderr,
                             )
+                        if log_mismatches:
+                            out_mismatches.write(json.dumps({"type": "exec_error", "error": "missing_sqlite", "question_id": qid, "db": db_id, "query": query, "hint": hint, "sql": gold_sql}, ensure_ascii=False) + "\n")
                         continue
                     try:
                         sconn = sqlite3.connect(str(sqlite_db_path))
@@ -847,6 +937,8 @@ def main() -> int:
                                 f"[baseline-sqlite-exec-error] {db_id} {qid}: {type(e).__name__}: {e}",
                                 file=sys.stderr,
                             )
+                        if log_mismatches:
+                            out_mismatches.write(json.dumps({"type": "exec_error", "error": "sqlite_exec", "question_id": qid, "db": db_id, "query": query, "hint": hint, "sql": gold_sql, "message": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n")
                         continue
 
                 stats = by_db.setdefault(db_id, EvalStats())
@@ -863,6 +955,8 @@ def main() -> int:
                             f"[baseline-transpile-error] {db_id} {qid}: {type(e).__name__}: {e}",
                             file=sys.stderr,
                         )
+                    if log_mismatches:
+                        out_mismatches.write(json.dumps({"type": "exec_error", "error": "transpile", "question_id": qid, "db": db_id, "query": query, "hint": hint, "sql": gold_sql, "message": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n")
                     continue
 
                 if args.rewrite:
@@ -876,6 +970,8 @@ def main() -> int:
                             f"[baseline-missing-duckdb] {db_id} {qid}: missing {duck_db_path}",
                             file=sys.stderr,
                         )
+                    if log_mismatches:
+                        out_mismatches.write(json.dumps({"type": "exec_error", "error": "missing_duckdb", "question_id": qid, "db": db_id, "query": query, "hint": hint, "sql": duck_sql}, ensure_ascii=False) + "\n")
                     continue
 
                 conn = duckdb.connect(str(duck_db_path), read_only=True)
@@ -888,6 +984,8 @@ def main() -> int:
                             f"[baseline-duckdb-exec-error] {db_id} {qid}: {type(e).__name__}: {e}\nSQL: {duck_sql}",
                             file=sys.stderr,
                         )
+                    if log_mismatches:
+                        out_mismatches.write(json.dumps({"type": "exec_error", "error": "duckdb_exec", "question_id": qid, "db": db_id, "query": query, "hint": hint, "sql": duck_sql, "message": f"{type(e).__name__}: {e}"}, ensure_ascii=False) + "\n")
                     continue
                 finally:
                     conn.close()
@@ -897,6 +995,19 @@ def main() -> int:
                     ok = rows_equal_unordered(exp, got) if args.unordered else rows_equal(exp, got)
                 else:
                     ok = rows_equal_sqlite_duckdb(sqlite_rows or [], got, unordered=bool(args.unordered))
+
+                tie_answers: list[list[list[Any]]] = []
+                if not ok and record_compatible:
+                    # Build a gold-like list[list[Any]] for both comparison modes.
+                    tie_ref: list[list[Any]] | None = None
+                    if args.compare_to == "gold":
+                        tie_ref = exp
+                    elif sqlite_rows is not None:
+                        tie_ref = _jsonable_rows(sqlite_rows)
+                    if tie_ref is not None:
+                        tie_answers = _tie_extra_answers(duck_sql, duck_db_path, got, tie_ref)
+                        if tie_answers:
+                            ok = True
 
                 if ok:
                     stats.correct += 1
@@ -914,6 +1025,8 @@ def main() -> int:
                                 "blendsql": blend_sql,
                                 "answer": _canonicalize_jsonable_rows(_jsonable_rows(got)),
                             }
+                            for i, alt in enumerate(tie_answers, start=2):
+                                rec[f"answer_{chr(ord('a') + i - 1)}"] = alt
                             if args.out_broken:
                                 if capture_records:
                                     compatible_records[key] = rec
@@ -921,6 +1034,22 @@ def main() -> int:
                                 out_compatible.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 else:
                     stats.mismatches += 1
+                    if log_mismatches:
+                        gold_ans = (
+                            _canonicalize_jsonable_rows(exp)
+                            if args.compare_to == "gold"
+                            else _canonicalize_jsonable_rows(_jsonable_rows(sqlite_rows or []))
+                        )
+                        rec = {
+                            "question_id": qid,
+                            "db": db_id,
+                            "query": query,
+                            "hint": hint,
+                            "sql": duck_sql,
+                            "gold_answer": gold_ans,
+                            "got_answer": _canonicalize_jsonable_rows(_jsonable_rows(got)),
+                        }
+                        out_mismatches.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
         return by_db, compatible, compatible_records
 
@@ -931,8 +1060,10 @@ def main() -> int:
         record_compatible=bool(args.drop_columns or out_compatible is not None),
         capture_records=bool(args.out_broken),
         print_errors=bool(args.print_baseline_errors),
+        log_mismatches=True,
     )
     _report("Baseline (no dropped columns)", duckdb_out_root, baseline_by_db)
+    print(f"Mismatches logged to: {duckdb_out_root / 'mismatches.jsonl'}")
 
     # Phase 2: drop columns and re-evaluate only on the baseline-compatible subset
     if args.drop_columns:
@@ -977,6 +1108,7 @@ def main() -> int:
             record_compatible=False,
             capture_records=False,
             print_errors=False,
+            log_mismatches=False,
         )
         print(f"\nBaseline-compatible subset size: {len(compatible)}")
         _report("After dropping columns (evaluated only on baseline-compatible subset)", drop_dst_root, dropped_by_db)
@@ -989,6 +1121,7 @@ def main() -> int:
                 record_compatible=True,
                 capture_records=False,
                 print_errors=False,
+                log_mismatches=False,
             )
             broken = compatible - still_ok
             for key in sorted(broken):
@@ -998,6 +1131,7 @@ def main() -> int:
 
     if out_compatible is not None:
         out_compatible.close()
+    out_mismatches.close()
 
     return 0
 
